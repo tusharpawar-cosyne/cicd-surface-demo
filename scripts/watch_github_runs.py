@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import os
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -35,6 +37,28 @@ def _require_token() -> str:
         if value:
             return value
     raise SystemExit("Set GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT before starting the watcher.")
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def _load_state() -> dict[str, Any]:
@@ -75,36 +99,82 @@ def _repo_slug() -> str:
     return slug
 
 
+class _NoRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        return None
+
+
 class GitHubClient:
     def __init__(self, repo: str, token: str) -> None:
         self.repo = repo
         self._token = token
         self._base = f"https://api.github.com/repos/{repo}"
 
-    def _request(self, url: str, *, accept: str = "application/vnd.github+json") -> bytes:
-        req = request.Request(
-            url,
-            headers={
-                "Accept": accept,
-                "Authorization": f"Bearer {self._token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": _env("WATCH_USER_AGENT", DEFAULT_USER_AGENT),
-            },
-        )
+    def _request(
+        self,
+        url: str,
+        *,
+        accept: str = "application/vnd.github+json",
+        include_auth: bool = True,
+        follow_redirects: bool = True,
+    ) -> tuple[int, dict[str, str], bytes]:
+        headers = {
+            "Accept": accept,
+            "User-Agent": _env("WATCH_USER_AGENT", DEFAULT_USER_AGENT),
+        }
+        if include_auth:
+            headers["Authorization"] = f"Bearer {self._token}"
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        req = request.Request(url, headers=headers)
+        opener = request.build_opener() if follow_redirects else request.build_opener(_NoRedirectHandler())
         try:
-            with request.urlopen(req, timeout=30) as response:
-                return response.read()
+            with opener.open(req, timeout=30) as response:
+                return int(getattr(response, "status", 200)), dict(response.headers.items()), response.read()
         except error.HTTPError as exc:
+            if not follow_redirects and exc.code in {301, 302, 303, 307, 308}:
+                return int(exc.code), dict(exc.headers.items()), exc.read()
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub API {exc.code} for {url}: {body}") from exc
 
     def json(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
         query = f"?{parse.urlencode(params)}" if params else ""
-        payload = self._request(f"{self._base}{path}{query}")
+        _status, _headers, payload = self._request(f"{self._base}{path}{query}")
         return json.loads(payload.decode("utf-8"))
 
-    def bytes(self, url: str, *, accept: str = "application/octet-stream") -> bytes:
-        return self._request(url, accept=accept)
+    def bytes(
+        self,
+        url: str,
+        *,
+        accept: str = "application/vnd.github+json",
+        include_auth: bool = True,
+        follow_redirects: bool = True,
+    ) -> bytes:
+        _status, _headers, payload = self._request(
+            url,
+            accept=accept,
+            include_auth=include_auth,
+            follow_redirects=follow_redirects,
+        )
+        return payload
+
+    def redirected_zip(self, url: str, *, kind: str) -> bytes:
+        status, headers, _payload = self._request(
+            url,
+            accept="application/vnd.github+json",
+            include_auth=True,
+            follow_redirects=False,
+        )
+        if status != 302:
+            raise RuntimeError(f"Expected {kind} download redirect for {url}, got HTTP {status}")
+        location = headers.get("Location") or headers.get("location")
+        if not location:
+            raise RuntimeError(f"{kind.capitalize()} download redirect for {url} did not include a Location header")
+        return self.bytes(
+            location,
+            accept="application/octet-stream",
+            include_auth=False,
+            follow_redirects=True,
+        )
 
 
 def _workflow_runs(client: GitHubClient) -> list[dict[str, Any]]:
@@ -144,7 +214,7 @@ def _download_and_extract_artifact(client: GitHubClient, artifact: dict[str, Any
     if not archive_url:
         raise RuntimeError(f"Artifact {artifact.get('name')} has no archive_download_url")
     destination.mkdir(parents=True, exist_ok=True)
-    payload = client.bytes(archive_url)
+    payload = client.redirected_zip(archive_url, kind="artifact")
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         zf.extractall(destination)
 
@@ -160,7 +230,7 @@ def _find_file(root: Path, filename: str) -> Path | None:
 def _download_logs_text(client: GitHubClient, run_id: str, fallback_path: Path | None) -> str:
     api_url = f"https://api.github.com/repos/{client.repo}/actions/runs/{run_id}/logs"
     try:
-        payload = client.bytes(api_url)
+        payload = client.redirected_zip(api_url, kind="log archive")
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             pieces: list[str] = []
             for name in sorted(zf.namelist()):
@@ -282,9 +352,43 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _run_key(run: dict[str, Any]) -> str:
+    return f"{run.get('id', '')}:{run.get('updated_at', '')}"
+
+
+def _run_is_after_cutoff(run: dict[str, Any], cutoff: datetime) -> bool:
+    updated_at = _parse_utc(run.get("updated_at"))
+    if updated_at is None:
+        return True
+    return updated_at > cutoff
+
+
+def _initialize_startup_baseline(
+    state: dict[str, Any],
+    runs: list[dict[str, Any]],
+    startup_cutoff: datetime,
+) -> None:
+    processed = state.setdefault("processed_runs", {})
+    skipped_existing = 0
+    for run in runs:
+        run_id = str(run.get("id") or "")
+        if not run_id:
+            continue
+        if _run_is_after_cutoff(run, startup_cutoff):
+            continue
+        processed[run_id] = _run_key(run)
+        skipped_existing += 1
+    state["startup_cutoff"] = _format_utc(startup_cutoff)
+    _save_state(state)
+    print(
+        f"[watcher] startup baseline {state['startup_cutoff']}: skipped {skipped_existing} existing completed runs",
+        file=sys.stderr,
+    )
+
+
 def _process_run(client: GitHubClient, run: dict[str, Any], state: dict[str, Any]) -> None:
     run_id = str(run["id"])
-    run_key = f"{run_id}:{run.get('updated_at', '')}"
+    run_key = _run_key(run)
     processed = state.setdefault("processed_runs", {})
     if processed.get(run_id) == run_key:
         return
@@ -352,20 +456,53 @@ def _process_run(client: GitHubClient, run: dict[str, Any], state: dict[str, Any
     print(f"[watcher] analyzed run {run_id}: {summary_path}")
 
 
-def _poll_once() -> None:
+def _poll_once(*, startup_cutoff: datetime, startup_state: dict[str, bool]) -> None:
     repo = _repo_slug()
     client = GitHubClient(repo=repo, token=_require_token())
     state = _load_state()
-    for run in _workflow_runs(client):
+    runs = _workflow_runs(client)
+    if not startup_state["baseline_initialized"]:
+        _initialize_startup_baseline(state, runs, startup_cutoff)
+        startup_state["baseline_initialized"] = True
+    for run in runs:
+        if not _run_is_after_cutoff(run, startup_cutoff):
+            continue
         _process_run(client, run, state)
+
+
+def _parse_cli_args(argv: list[str]) -> tuple[bool, bool]:
+    once = False
+    replay_existing = False
+    for arg in argv[1:]:
+        if arg == "once":
+            once = True
+            continue
+        if arg == "--replay-existing":
+            replay_existing = True
+            continue
+        print(
+            "usage: python scripts/watch_github_runs.py [once] [--replay-existing]",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return once, replay_existing
 
 
 def main() -> int:
     interval = int(_env("WATCH_POLL_INTERVAL_SECONDS", str(DEFAULT_POLL_INTERVAL_SECONDS)))
-    once = len(sys.argv) > 1 and sys.argv[1] == "once"
+    once, replay_existing = _parse_cli_args(sys.argv)
+    startup_cutoff = _now_utc()
+    startup_state = {"baseline_initialized": replay_existing}
     while True:
         try:
-            _poll_once()
+            if replay_existing:
+                repo = _repo_slug()
+                client = GitHubClient(repo=repo, token=_require_token())
+                state = _load_state()
+                for run in _workflow_runs(client):
+                    _process_run(client, run, state)
+            else:
+                _poll_once(startup_cutoff=startup_cutoff, startup_state=startup_state)
         except KeyboardInterrupt:
             return 130
         except Exception as exc:  # noqa: BLE001

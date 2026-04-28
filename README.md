@@ -56,6 +56,12 @@ For `push`, the workflow chooses automatically:
    /Users/tushar/miniconda3/envs/a1/bin/python scripts/watch_github_runs.py
    ```
 
+   Add `--replay-existing` if you want the watcher to also analyze completed runs that already existed before the watcher started:
+
+   ```bash
+   /Users/tushar/miniconda3/envs/a1/bin/python scripts/watch_github_runs.py --replay-existing
+   ```
+
 Optional overrides:
 
 - `WATCH_REPOSITORY=owner/repo`
@@ -114,4 +120,4 @@ That keeps GitHub-hosted CI and local governed analysis cleanly separated.
 - `scripts/watch_github_runs.py`: local poller that turns completed GitHub runs into local governed analyses
 - `scripts/analyze_with_qstore.py`: local MCP ingestion and analysis client for the downloaded run payload
 
-test1
+test2
