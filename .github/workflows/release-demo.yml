@@ -1,0 +1,117 @@
+name: release-decision-demo
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Visible manual demos: safe-release, migration-repeat, evidence-gap"
+        required: false
+        default: ""
+      release_id:
+        description: "Optional external release identifier"
+        required: false
+        default: ""
+      notes:
+        description: "Optional operator notes"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    name: Prepare scenario evidence
+    runs-on: ubuntu-latest
+    outputs:
+      scenario: ${{ steps.prepare.outputs.scenario }}
+      environment: ${{ steps.prepare.outputs.environment }}
+      should_deploy: ${{ steps.prepare.outputs.should_deploy }}
+      should_fail: ${{ steps.prepare.outputs.should_fail }}
+      deployment_id: ${{ steps.prepare.outputs.deployment_id }}
+      canonical_run_id: ${{ steps.prepare.outputs.canonical_run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Select scenario
+        id: scenario
+        env:
+          INPUT_SCENARIO: ${{ github.event_name == 'workflow_dispatch' && inputs.scenario || '' }}
+        run: |
+          python scripts/release_demo.py select-scenario
+
+      - name: Emit scenario log
+        env:
+          INPUT_SCENARIO: ${{ steps.scenario.outputs.scenario }}
+        run: |
+          mkdir -p .demo/runtime
+          python scripts/release_demo.py emit-log | tee .demo/runtime/emitted.log
+
+      - name: Prepare scenario assets
+        id: prepare
+        env:
+          INPUT_SCENARIO: ${{ steps.scenario.outputs.scenario }}
+          INPUT_RELEASE_ID: ${{ inputs.release_id }}
+          INPUT_NOTES: ${{ inputs.notes }}
+        run: |
+          python scripts/release_demo.py prepare
+
+      - name: Upload QStore evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qstore-evidence-${{ github.run_id }}
+          path: .demo/out
+          if-no-files-found: error
+
+      - name: Force the failure path when required
+        if: steps.prepare.outputs.should_fail == 'true'
+        run: |
+          echo "Scenario requires a failing gate." >&2
+          exit 1
+
+  deploy:
+    name: Deploy candidate
+    needs: prepare
+    if: needs.prepare.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.prepare.outputs.environment }}
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: qstore-evidence-${{ github.run_id }}
+          path: .demo/out
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Finalize deployment evidence
+        env:
+          DEPLOY_ENVIRONMENT: ${{ needs.prepare.outputs.environment }}
+          DEPLOYMENT_ID: ${{ needs.prepare.outputs.deployment_id }}
+          INPUT_SCENARIO: ${{ needs.prepare.outputs.scenario }}
+        run: |
+          python scripts/release_demo.py finalize-deploy
+
+      - name: Upload deployment receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-receipt-${{ github.run_id }}
+          path: .demo/out/deploy-receipt.json
+          if-no-files-found: error
